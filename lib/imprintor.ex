@@ -16,6 +16,18 @@ defmodule Imprintor do
       clears the rest. Memory is held for as long as the longest running
       compile, not for as long as compiles keep overlapping.
 
+  A very long compile can still hold on to what many shorter ones cache around
+  it. To cap that, set a limit in bytes on Imprintor's native memory (the
+  cache plus compiles in progress):
+
+      config :imprintor, cache_memory_limit: 1_000_000_000
+
+  Above the limit, only entries used by roughly the last 10 compiles are kept,
+  so a running compile may have to redo some work. Set the limit well above
+  what your concurrent compiles need, or it will trigger on every compile. It
+  can also be set per call with the `:cache_memory_limit` option of
+  `Imprintor.Config.new/3`.
+
   Freed memory goes back to the allocator for reuse, so the OS process size
   settles near its peak instead of dropping back.
   """

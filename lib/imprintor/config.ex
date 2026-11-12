@@ -14,6 +14,8 @@ defmodule Imprintor.Config do
   * `:data` - A map containing template data and variables for document generation
   * `:pdf_standard` - Optional PDF standard string (e.g. `"a-3a"`, `"ua-1"`, `"1.7"`)
   * `:ppi` - Optional pixels-per-inch used for PNG rendering (defaults to `144.0`)
+  * `:cache_memory_limit` - Optional limit, in bytes, on Imprintor's native memory before the
+    cache is cleared more aggressively (see "Memory" in `Imprintor`)
 
   ## Examples
 
@@ -33,7 +35,15 @@ defmodule Imprintor.Config do
       ])
   """
 
-  defstruct [:source_document, :extra_fonts, :root_directory, :data, :pdf_standard, :ppi]
+  defstruct [
+    :source_document,
+    :extra_fonts,
+    :root_directory,
+    :data,
+    :pdf_standard,
+    :ppi,
+    :cache_memory_limit
+  ]
 
   @doc """
   Creates a new configuration struct.
@@ -50,6 +60,9 @@ defmodule Imprintor.Config do
   * `:root_directory` - Root directory for resolving relative paths (defaults to `"."`)
   * `:pdf_standard` - PDF standard to enforce (defaults to `nil` / Typst default)
   * `:ppi` - Pixels-per-inch for PNG rendering (defaults to `nil`, which uses `144.0`)
+  * `:cache_memory_limit` - Bytes of native memory above which Typst's cache is cleared more
+    aggressively while other compiles are running (defaults to
+    `Application.get_env(:imprintor, :cache_memory_limit)`, and to no limit if that isn't set)
 
   ## Returns
 
@@ -87,13 +100,19 @@ defmodule Imprintor.Config do
 
     ppi = Keyword.get(opts, :ppi)
 
+    cache_memory_limit =
+      Keyword.get_lazy(opts, :cache_memory_limit, fn ->
+        Application.get_env(:imprintor, :cache_memory_limit)
+      end)
+
     %__MODULE__{
       source_document: source_document,
       extra_fonts: extra_fonts,
       root_directory: root_directory,
       data: data,
       pdf_standard: pdf_standard,
-      ppi: ppi
+      ppi: ppi,
+      cache_memory_limit: cache_memory_limit
     }
   end
 end

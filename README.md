@@ -229,6 +229,14 @@ config = Imprintor.Config.new(template, data, pdf_standard: "a-3a")
 
 Typst caches compile work in native memory, outside the BEAM, so `:erlang.memory/0` doesn't show it. Imprintor clears the cache after each compile, but keeps what compiles still running may need: everything used since the oldest running compile started. Memory is therefore held for as long as the longest compile runs, not for as long as compiles keep overlapping.
 
+If very long compiles run alongside many short ones, you can cap Imprintor's native memory (in bytes). Above the limit, only entries used by roughly the last 10 compiles are kept:
+
+```elixir
+config :imprintor, cache_memory_limit: 1_000_000_000
+```
+
+The limit includes compiles in progress, so set it well above what your concurrent compiles need. See "Memory" in the `Imprintor` docs for details.
+
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.

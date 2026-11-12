@@ -879,26 +879,44 @@ defmodule ImprintorTest do
     end
   end
 
-  test "concurrent compiles of multi-pass documents succeed" do
-    # Compiles finishing while others still run evict the cache mid-flight,
-    # which must not break the compiles that are still running.
-    results =
-      1..8
-      |> Task.async_stream(
-        fn n ->
-          Imprintor.Config.new(
-            "= Page #sys.inputs.elixir_data.n\n#outline()\n= A\n#lorem(400)\n= B\n#lorem(400)",
-            %{n: n}
-          )
-          |> Imprintor.compile_to_pdf()
-        end,
-        max_concurrency: 8,
-        timeout: 60_000
-      )
-      |> Enum.map(fn {:ok, result} -> result end)
+  describe "cache_memory_limit" do
+    test "defaults to the application config, and an option overrides it" do
+      assert Imprintor.Config.new("= Hi").cache_memory_limit == nil
 
-    for result <- results do
-      assert {:ok, "%PDF" <> _} = result
+      Application.put_env(:imprintor, :cache_memory_limit, 123)
+
+      try do
+        assert Imprintor.Config.new("= Hi").cache_memory_limit == 123
+
+        assert Imprintor.Config.new("= Hi", %{}, cache_memory_limit: 456).cache_memory_limit ==
+                 456
+      after
+        Application.delete_env(:imprintor, :cache_memory_limit)
+      end
+    end
+
+    test "concurrent compiles succeed while always over the limit" do
+      # A limit of 0 is always exceeded, so every compile that finishes while
+      # others run takes the failsafe path and evicts mid-flight.
+      results =
+        1..8
+        |> Task.async_stream(
+          fn n ->
+            Imprintor.Config.new(
+              "= Page #sys.inputs.elixir_data.n\n#outline()\n= A\n#lorem(400)\n= B\n#lorem(400)",
+              %{n: n},
+              cache_memory_limit: 0
+            )
+            |> Imprintor.compile_to_pdf()
+          end,
+          max_concurrency: 8,
+          timeout: 60_000
+        )
+        |> Enum.map(fn {:ok, result} -> result end)
+
+      for result <- results do
+        assert {:ok, "%PDF" <> _} = result
+      end
     end
   end
 end

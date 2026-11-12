@@ -3,6 +3,7 @@
 ## Unreleased
 
 - **Fixed:** native memory no longer grows while compiles keep overlapping. 0.9.1 cleared Typst's cache only when no compile was running, so with sustained concurrent compiles (e.g. a busy job queue) it was never cleared: in a test with 4 workers compiling back to back, memory grew by about 4 MB per compile, to 7 GB after 1,600 compiles. Each compile now records when it started, and when one finishes, the cache keeps everything used since the oldest running compile started and drops the rest. Running compiles keep their cached work, as in 0.9.1, and memory is held only as long as the longest running compile.
+- **Added:** `config :imprintor, cache_memory_limit: bytes` (or the `:cache_memory_limit` option of `Imprintor.Config.new/3`) caps Imprintor's native memory. Above the limit, only cache entries used by roughly the last 10 compiles are kept, even if an older compile is still running. There is no limit by default.
 
 ## 0.9.1
 

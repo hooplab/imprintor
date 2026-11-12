@@ -1,7 +1,9 @@
 use rustler::types::binary;
 use rustler::{NifStruct, Term};
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use typst::diag::{FileError, FileResult, PackageError, PackageResult};
 use typst::ecow::eco_format;
@@ -67,6 +69,7 @@ pub struct ImprintorConfig<'a> {
     root_directory: String,
     pdf_standard: Option<String>,
     ppi: Option<f64>,
+    cache_memory_limit: Option<u64>,
 }
 
 impl ImprintorNifWorld {
@@ -305,6 +308,57 @@ impl typst::World for ImprintorNifWorld {
     }
 }
 
+/// Counts the bytes this NIF library currently has allocated on its Rust heap.
+///
+/// A Rust NIF library has its own global allocator, separate from the BEAM's,
+/// so this covers Typst's memoization cache and the compiles in flight, and
+/// nothing else in the VM. It is used as the cache size for the memory limit,
+/// because `comemo` doesn't expose one.
+struct CountingAllocator;
+
+static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = System.alloc(layout);
+        if !ptr.is_null() {
+            ALLOCATED_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        }
+        ptr
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let ptr = System.alloc_zeroed(layout);
+        if !ptr.is_null() {
+            ALLOCATED_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        System.dealloc(ptr, layout);
+        ALLOCATED_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let new_ptr = System.realloc(ptr, layout, new_size);
+        if !new_ptr.is_null() {
+            ALLOCATED_BYTES.fetch_add(new_size, Ordering::Relaxed);
+            ALLOCATED_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+        }
+        new_ptr
+    }
+}
+
+#[global_allocator]
+static GLOBAL: CountingAllocator = CountingAllocator;
+
+/// How many evictions an entry may go unused before the memory limit
+/// failsafe drops it, matching `typst-cli`'s watch mode. The failsafe evicts
+/// after every compile that finishes while over the limit, so this keeps
+/// roughly the entries used by the last 10 compiles.
+const OVER_LIMIT_MAX_AGE: usize = 10;
+
 /// What to pass to `comemo::evict` when a compile finishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Eviction {
@@ -346,6 +400,9 @@ impl Eviction {
 /// Counting compiles in flight and clearing only at zero (as 0.9.1 did) never
 /// clears anything while compiles keep overlapping, so memory grew for as long
 /// as a burst lasted. This keeps memory bounded by the longest compile instead.
+/// A very long compile can still hold on to what shorter ones cache around it,
+/// so a memory limit can make it fall back to keeping only the entries used by
+/// the last `OVER_LIMIT_MAX_AGE` compiles.
 struct CacheTracker {
     state: Mutex<TrackerState>,
 }
@@ -388,7 +445,7 @@ impl CacheTracker {
     /// Unregisters a finished compile, then runs `evict` with the eviction to
     /// do. `evict` runs while the lock is held, so evictions happen in the same
     /// order they are counted, which the ages depend on.
-    fn leave(&self, start: u64, evict: impl FnOnce(&Eviction)) {
+    fn leave(&self, start: u64, over_limit: bool, evict: impl FnOnce(&Eviction)) {
         let mut state = self.lock();
 
         if let Some(count) = state.active.get_mut(&start) {
@@ -406,7 +463,13 @@ impl CacheTracker {
                 // `state.evictions - used` after this eviction. Every running
                 // compile started at `oldest_start` or later, so this keeps
                 // every entry used since then.
-                Eviction::OlderThan((state.evictions - oldest_start) as usize)
+                let since_oldest = (state.evictions - oldest_start) as usize;
+                let max_age = if over_limit {
+                    since_oldest.min(OVER_LIMIT_MAX_AGE)
+                } else {
+                    since_oldest
+                };
+                Eviction::OlderThan(max_age)
             }
         };
 
@@ -420,19 +483,24 @@ static CACHE_TRACKER: CacheTracker = CacheTracker::new();
 /// dropped, after the world and document, also on early returns and panics.
 struct CompileGuard {
     start: u64,
+    cache_memory_limit: Option<u64>,
 }
 
 impl CompileGuard {
-    fn enter() -> Self {
+    fn enter(cache_memory_limit: Option<u64>) -> Self {
         Self {
             start: CACHE_TRACKER.enter(),
+            cache_memory_limit,
         }
     }
 }
 
 impl Drop for CompileGuard {
     fn drop(&mut self) {
-        CACHE_TRACKER.leave(self.start, |eviction| {
+        let over_limit = self
+            .cache_memory_limit
+            .is_some_and(|limit| ALLOCATED_BYTES.load(Ordering::Relaxed) as u64 > limit);
+        CACHE_TRACKER.leave(self.start, over_limit, |eviction| {
             typst::comemo::evict(eviction.max_age())
         });
     }
@@ -447,7 +515,7 @@ fn compile_with<T>(
 ) -> Result<T, String> {
     // Declared first so it drops last, after the world and document, and also
     // on early returns and panics.
-    let _guard = CompileGuard::enter();
+    let _guard = CompileGuard::enter(config.cache_memory_limit);
     let world = ImprintorNifWorld::new(config);
     let document = compile_document(&world)?;
     export(&document)
@@ -645,7 +713,6 @@ fn parse_pdf_standard(input: &str) -> Option<PdfStandard> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// `build_pdf_options` only ever calls `PdfStandards::new` with a single
     /// standard, so it can never hit the conflicting-standards error branch.
@@ -662,9 +729,9 @@ mod tests {
     }
 
     /// Runs `leave` and returns the eviction it decided on.
-    fn leave(tracker: &CacheTracker, start: u64) -> Eviction {
+    fn leave(tracker: &CacheTracker, start: u64, over_limit: bool) -> Eviction {
         let mut decided = None;
-        tracker.leave(start, |eviction| decided = Some(*eviction));
+        tracker.leave(start, over_limit, |eviction| decided = Some(*eviction));
         decided.expect("leave always decides on an eviction")
     }
 
@@ -672,7 +739,7 @@ mod tests {
     fn last_compile_to_finish_clears_everything() {
         let tracker = CacheTracker::new();
         let start = tracker.enter();
-        assert_eq!(leave(&tracker, start), Eviction::All);
+        assert_eq!(leave(&tracker, start, false), Eviction::All);
     }
 
     #[test]
@@ -685,10 +752,10 @@ mod tests {
         // anything it used is at most that old and must be kept.
         for n in 1..=50 {
             let short = tracker.enter();
-            assert_eq!(leave(&tracker, short), Eviction::OlderThan(n));
+            assert_eq!(leave(&tracker, short, false), Eviction::OlderThan(n));
         }
 
-        assert_eq!(leave(&tracker, long), Eviction::All);
+        assert_eq!(leave(&tracker, long, false), Eviction::All);
     }
 
     #[test]
@@ -696,13 +763,13 @@ mod tests {
         let tracker = CacheTracker::new();
         let first = tracker.enter(); // generation 0
         let filler = tracker.enter();
-        assert_eq!(leave(&tracker, filler), Eviction::OlderThan(1));
+        assert_eq!(leave(&tracker, filler, false), Eviction::OlderThan(1));
 
         let second = tracker.enter(); // generation 1
                                       // `first` finishing leaves `second` as the oldest: 2 evictions have
                                       // passed since generation 1 started... minus the one before it.
-        assert_eq!(leave(&tracker, first), Eviction::OlderThan(1));
-        assert_eq!(leave(&tracker, second), Eviction::All);
+        assert_eq!(leave(&tracker, first, false), Eviction::OlderThan(1));
+        assert_eq!(leave(&tracker, second, false), Eviction::All);
     }
 
     #[test]
@@ -712,8 +779,36 @@ mod tests {
         let b = tracker.enter();
         assert_eq!(a, b);
 
-        assert_eq!(leave(&tracker, a), Eviction::OlderThan(1));
-        assert_eq!(leave(&tracker, b), Eviction::All);
+        assert_eq!(leave(&tracker, a, false), Eviction::OlderThan(1));
+        assert_eq!(leave(&tracker, b, false), Eviction::All);
+    }
+
+    #[test]
+    fn over_the_memory_limit_caps_the_age_kept() {
+        let tracker = CacheTracker::new();
+        let long = tracker.enter();
+        for _ in 0..50 {
+            let short = tracker.enter();
+            leave(&tracker, short, false);
+        }
+
+        let short = tracker.enter();
+        assert_eq!(
+            leave(&tracker, short, true),
+            Eviction::OlderThan(OVER_LIMIT_MAX_AGE)
+        );
+        // Over the limit with nothing else running still clears everything.
+        assert_eq!(leave(&tracker, long, true), Eviction::All);
+    }
+
+    #[test]
+    fn over_the_memory_limit_never_keeps_more_than_without_it() {
+        let tracker = CacheTracker::new();
+        let long = tracker.enter();
+        let short = tracker.enter();
+        // Only 1 eviction since the long compile started, below the cap.
+        assert_eq!(leave(&tracker, short, true), Eviction::OlderThan(1));
+        leave(&tracker, long, true);
     }
 
     #[test]
@@ -725,7 +820,7 @@ mod tests {
             struct Leave<'a>(&'a CacheTracker, u64);
             impl Drop for Leave<'_> {
                 fn drop(&mut self) {
-                    self.0.leave(self.1, |_| {});
+                    self.0.leave(self.1, false, |_| {});
                 }
             }
             let _leave = Leave(&tracker, start);
@@ -746,7 +841,7 @@ mod tests {
                 std::thread::spawn(|| {
                     for _ in 0..1000 {
                         let start = TRACKER.enter();
-                        TRACKER.leave(start, |eviction| {
+                        TRACKER.leave(start, false, |eviction| {
                             if *eviction == Eviction::All {
                                 CLEARED_ALL.fetch_add(1, Ordering::SeqCst);
                             }
@@ -797,7 +892,7 @@ mod tests {
         for n in 0..30u64 {
             let short = tracker.enter();
             memoized(1000 + n); // each short compile's own work
-            tracker.leave(short, evict);
+            tracker.leave(short, false, evict);
         }
         // The long compile's entry survived 30 evictions, and so did the
         // short compiles' entries, since the long compile could still use them.
@@ -807,14 +902,27 @@ mod tests {
         // A compile that starts now and outlives the long one.
         let late = tracker.enter();
         memoized(2);
-        tracker.leave(long, evict);
+        tracker.leave(long, false, evict);
         // `late` is now the oldest. Entries it used are kept, and older ones
         // that nothing has used since it started are dropped.
         assert!(cached(2));
         assert!(!cached(1001));
 
-        tracker.leave(late, evict);
+        tracker.leave(late, false, evict);
         assert!(!cached(2));
+    }
+
+    #[test]
+    fn counting_allocator_tracks_live_bytes() {
+        let before = ALLOCATED_BYTES.load(Ordering::SeqCst);
+        let buffer = vec![0u8; 64 * 1024 * 1024];
+        let during = ALLOCATED_BYTES.load(Ordering::SeqCst);
+        drop(buffer);
+        let after = ALLOCATED_BYTES.load(Ordering::SeqCst);
+
+        // Other tests allocate concurrently, so allow some slack.
+        assert!(during >= before + 60 * 1024 * 1024);
+        assert!(after < during - 60 * 1024 * 1024);
     }
 }
 
